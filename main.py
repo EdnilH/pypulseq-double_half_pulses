@@ -6,7 +6,6 @@ from pypulseq.utils.safe_pns_prediction import safe_example_hw
 from warnings import warn
 from pypulseq.convert import convert
 
-from make_ro_gradient import make_basic_gx_gradient_separat
 from make_half_sinc_pulse import make_half_sinc_pulse
 
 
@@ -49,15 +48,20 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
     # ======
 
     # Readout with spoiler (and prephaser for slice profile sequences)
-    if not slice_profile:
-        gx_base, spoil_base = make_basic_gx_gradient_separat(system=system, delay=60e-6)
-        ro = pp.add_gradients([gx_base, spoil_base])
-        adc = pp.make_adc(num_samples=num_samples, duration=gx_base.flat_time, delay=0, system=system)
+    duration = ro_dwell * num_samples
+    if slice_profile:
+        gx = pp.make_trapezoid(channel='z', area=1/resolution, duration=duration, system=system)
+        spoiler = pp.make_trapezoid(channel='z', area=0.5*gx.area, system=system, delay=gx.rise_time)
+        prephase = pp.make_trapezoid(channel='z', area=-gx.area/2, system=system, duration=max(pp.calc_duration(gx)/4, 200e-6))
+        dur_prephase = prephase.rise_time + prephase.flat_time + prephase.fall_time
+        gx.delay += dur_prephase
+        spoiler.delay += dur_prephase
+        ro = pp.add_gradients([prephase, gx, spoiler])
     else:
-        gx_base, spoil_base, prephase_base = make_basic_gx_gradient_separat(system=system, delay=0, slice_profile=True)
-        ro = pp.add_gradients([prephase_base, gx_base, spoil_base])
-        adc = pp.make_adc(num_samples=num_samples, duration=gx_base.flat_time,
-                          delay=pp.calc_duration(prephase_base)+gx_base.rise_time, system=system)
+        gx = pp.make_trapezoid(channel='x', area=1/resolution, duration=duration, system=system)
+        spoiler = pp.make_trapezoid(channel='x', area=0.5*gx.area, system=system, delay=gx.rise_time)
+        ro = pp.add_gradients([gx, spoiler])
+    adc = pp.make_adc(num_samples=num_samples, dwell=ro_dwell, system=system)
 
     # RF Pulse and all parts for slice select gradient
     rf_left, slice_select, mid_phase, rephase = make_half_sinc_pulse(flip_angle=flip_angle * np.pi / 180,
