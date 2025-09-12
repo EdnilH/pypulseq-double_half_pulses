@@ -4,31 +4,32 @@ import matplotlib.pyplot as plt
 from datetime import datetime
 from pypulseq.utils.safe_pns_prediction import safe_example_hw
 from warnings import warn
-from make_z_gradient import make_z_gradient_separat
+from pypulseq.convert import convert
+
 from make_ro_gradient import make_basic_gx_gradient_separat
 from make_half_sinc_pulse import make_half_sinc_pulse
 
 
 def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=False, write_seq=False,
-         seq_filename: str = 'double_half_pulse_pypulseq', save=False, slice_profile=False):
-
-    double_golden_angle = 4 * np.pi / (np.sqrt(5) + 1)  # Angular increment
-
+         seq_filename: str = 'double_half_pulse', save=False, slice_profile=False):
+    # ======
+    # SETUP
+    # ======
     # Set system limits
     system = pp.Opts(max_grad=58,
                      grad_unit='mT/m',
                      # grad_raster_time=10e-6,  # standard
                      max_slew=200,  # 180
                      slew_unit='mT/m/ms',
-                     rf_dead_time=100e-6,
+                     rf_dead_time=8e-6,
                      # rf_raster_time=1e-6,  # standard
                      # adc_raster_time=100e-9,  #standard
                      rf_ringdown_time=0,
                      B0=2.893620,
                      gamma=42.577e6
                      )
-
     seq = pp.Sequence(system=system)  # Create a new sequence object, with system settings
+    #print(system)
 
     num_spokes = 4  # Number of radial spokes
     num_samples = 128  # Number of measurement points in adc
@@ -37,29 +38,39 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
     rf_time_bw_product = 2  # 2*Number of zeros in sinc
     rf_delay = system.rf_dead_time
     rf_apodization = 0.5  # ?
+    slice_thickness = 15e-3 # m
+    resolution = 4e-3  # m
+    ro_dwell = 3
+
+    double_golden_angle = 4 * np.pi / (np.sqrt(5) + 1)  # Angular increment
 
     # ======
-    # Prepare Events
+    # PREPARE EVENTS
     # ======
-    slice_select, mid_phase, rephase = make_z_gradient_separat(system=system, ss_rut=rf_delay)
+
+    # Readout with spoiler (and prephaser for slice profile sequences)
     if not slice_profile:
         gx_base, spoil_base = make_basic_gx_gradient_separat(system=system, delay=60e-6)
-        gx_and_spoil = pp.add_gradients([gx_base, spoil_base])
+        ro = pp.add_gradients([gx_base, spoil_base])
         adc = pp.make_adc(num_samples=num_samples, duration=gx_base.flat_time, delay=0, system=system)
     else:
         gx_base, spoil_base, prephase_base = make_basic_gx_gradient_separat(system=system, delay=0, slice_profile=True)
-        gx_and_spoil = pp.add_gradients([prephase_base, gx_base, spoil_base])
+        ro = pp.add_gradients([prephase_base, gx_base, spoil_base])
         adc = pp.make_adc(num_samples=num_samples, duration=gx_base.flat_time,
                           delay=pp.calc_duration(prephase_base)+gx_base.rise_time, system=system)
 
-    rf_left = make_half_sinc_pulse(flip_angle=flip_angle * np.pi / 180,
-                                   side="left",
-                                   apodization=rf_apodization,
-                                   duration=rf_duration,
-                                   delay=rf_delay,  # rf on flat of slice select
-                                   system=system,
-                                   use='excitation',
-                                   time_bw_product=rf_time_bw_product)
+    # RF Pulse and all parts for slice select gradient
+    rf_left, slice_select, mid_phase, rephase = make_half_sinc_pulse(flip_angle=flip_angle * np.pi / 180,
+                                                                     side="left",
+                                                                     apodization=rf_apodization,
+                                                                     duration=rf_duration,
+                                                                     delay=rf_delay,  # rf on flat of slice select
+                                                                     system=system,
+                                                                     use='excitation',
+                                                                     time_bw_product=rf_time_bw_product,
+                                                                     return_gz=True,  # Needs to be done only once, if both pulses are the same.
+                                                                     slice_thickness=slice_thickness,
+                                                                     max_grad=1e6)  # Hz/m
     rf_right = make_half_sinc_pulse(flip_angle=flip_angle * np.pi / 180,
                                     side="right",
                                     apodization=rf_apodization,
@@ -67,10 +78,13 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
                                     delay=rf_delay,
                                     system=system,
                                     use='excitation',
-                                    time_bw_product=rf_time_bw_product)
-
+                                    time_bw_product=rf_time_bw_product,
+                                    return_gz=True,  # Needs to be done only once, if both pulses are the same.
+                                    slice_thickness=slice_thickness,
+                                    max_grad=1e6  #Hz/m
+                                    )[0]
     # ======
-    # Create Sequence
+    # CONSTRUCT SEQUENCE
     # ======
     for i in range(0, num_spokes):
         # Add complete slice select with rf pulses at corresponding times.
@@ -81,15 +95,15 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
         # Readout gradient gets rotated by the double golden angle for each spoke (i).
         # If Gradient is purely on x or y axis, the function returns only one parameter, otherwise two.
         # This behaviour is caught here.
-        if len(pp.rotate(gx_and_spoil, angle=i*double_golden_angle, axis='z')) == 1:
-            g = pp.rotate(gx_and_spoil, angle=i*double_golden_angle, axis='z')[0]
+        if len(pp.rotate(ro, angle=i*double_golden_angle, axis='z')) == 1:
+            g = pp.rotate(ro, angle=i*double_golden_angle, axis='z')[0]
             seq.add_block(g, adc)
         else:
-            gx, gy = pp.rotate(gx_and_spoil, angle=i*double_golden_angle, axis='z')
+            gx, gy = pp.rotate(ro, angle=i*double_golden_angle, axis='z')
             seq.add_block(gx, gy, adc)
         if i == 0:
             # The length of one complete block should be TR.
-            print(f"TR: {seq.duration()[0]*10**3:.2f}ms")
+            print(f"TR: {seq.duration()[0]*1e3:.2f}ms")
 
     print(f"Duration of entire sequence: {seq.duration()[0]*1e3:.2f}ms")
 
@@ -98,7 +112,7 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
     if ok:
         print('Timing check passed successfully')
     else:
-        print('Timing check failed. Error listing follows:')
+        warn('Timing check failed. Error listing follows:')
         [print(e) for e in error_report]
 
     ## PNS calc (Peripheral Nerve Stimulation)
@@ -111,17 +125,22 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
     # ======
     # VISUALIZATION
     # ======
-    folder_plots = "/data/projects/mptrainee_pulseq/media/"
-    prefix = f"{datetime.now().strftime('%Y%m%d-%H_%M')}-{num_spokes}_spokes-{num_samples}_samples"
+    folder = "/data/projects/mptrainee_pulseq/"
+    folder_plots = f"{folder}media/"
+    folder_traj = f"{folder}trajectories/"
+    folder_seq = f"{folder}sequences/"
+    prefix = f"{datetime.now().strftime('%Y%m%d-%H_%M')}-{num_spokes}_spokes-{num_samples}_samples-{slice_thickness*1e3}_mm"
+
     if plot_seq:
-        seq.plot(time_disp='ms', plot_now=False, show_blocks=False, save=save)
+        seq.plot(time_disp='ms' ,plot_now=False, show_blocks=False, save=save)
 
     # Trajectory calculation
     ktraj_adc, ktraj, t_excitation, t_refocusing, t_adc = seq.calculate_kspace()
     time_axis = np.arange(1, ktraj.shape[1] + 1) * system.grad_raster_time
     last_kx_t = time_axis[-1]
     last_adc_t = t_adc[-1]
-    fac = last_kx_t / (last_adc_t + spoil_base.flat_time + spoil_base.fall_time + 30e-6)
+     # fac = last_kx_t / (last_adc_t + spoil_base.flat_time + spoil_base.fall_time)
+    fac = 0.4
     time_axis = time_axis / fac
 
     if plot_k_space_traj:
@@ -171,12 +190,11 @@ def main(plot_seq=True, plot_k_space_traj=True, plot_2D_k_space=True, plot_grad=
         # Prepare the sequence output for the scanner
         # seq.set_definition(key='FOV', value=[fov, fov, slice_thickness])
         seq.set_definition(key='Name', value='UTE-Double_Half_Sinc-Hannah')
-        folder_seq = "/data/projects/mptrainee_pulseq/sequences/"
         if slice_profile:
-            seq.write(f"{folder_seq}slice_profile_sequence-{num_spokes}_spokes-{num_samples}-inverse_slice_select_gradient.seq")
+            seq.write(f"{folder_seq}slice_profile_sequence-{prefix}.seq")
         else:
-            seq.write(f"{folder_seq}{seq_filename}-{num_spokes}_spokes-{num_samples}_samples-inverse_slice_select_gradient.seq")
-            np.savetxt(f"{prefix}-trajectory.txt",ktraj_adc ,delimiter=";",fmt="%g")
+            seq.write(f"{folder_seq}{seq_filename}-{prefix}.seq")
+            np.savetxt(f"{folder_traj}{prefix}-trajectory.txt", ktraj_adc, delimiter=";", fmt="%g")
 
 
 if __name__ == '__main__':
